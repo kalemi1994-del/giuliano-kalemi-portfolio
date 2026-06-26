@@ -16,6 +16,24 @@ import mammoth from 'mammoth';
 
 const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 8 * 1024 * 1024 } });
 
+// Gemini occasionally returns a transient 503 "UNAVAILABLE / high demand" error.
+// Retry a couple of times with a short backoff before giving up.
+async function generateWithRetry(ai: GoogleGenAI, params: Parameters<GoogleGenAI['models']['generateContent']>[0], maxAttempts = 3) {
+  let lastError: any;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      return await ai.models.generateContent(params);
+    } catch (err: any) {
+      lastError = err;
+      const isRetryable = err?.status === 503;
+      if (!isRetryable || attempt === maxAttempts) throw err;
+      console.warn(`Gemini 503, ritento (tentativo ${attempt}/${maxAttempts})...`);
+      await new Promise((resolve) => setTimeout(resolve, attempt * 1500));
+    }
+  }
+  throw lastError;
+}
+
 async function extractDocumentText(file: Express.Multer.File): Promise<string> {
   if (file.mimetype === 'application/pdf') {
     const parser = new PDFParse({ data: file.buffer });
@@ -245,13 +263,14 @@ Genera un Audit preliminare di Marketing e AI basato sui seguenti dati forniti d
 - Sfide principali o obiettivi: ${challenges}
 - Email del richiedente: ${email || 'Non specificata'}
 ${documentExcerpt ? `
-Il cliente ha inoltre caricato un documento ("${documentName}"). Ecco un estratto del suo contenuto reale — usalo come fonte primaria per personalizzare l'analisi e cita elementi concreti tratti da questo testo dove rilevante:
+Il cliente ha inoltre caricato un documento ("${documentName}"). Ecco un estratto del suo contenuto reale:
 """
 ${documentExcerpt}
 """
+IMPORTANTE: poiché è stato caricato un documento, aggiungi nel report una sotto-sezione dedicata chiamata "**Cosa migliorare nel documento caricato**", con 2-4 punti concreti e specifici (non generici) su cosa non funziona o si può rafforzare in quel testo — chiarezza del messaggio, struttura, coerenza con il pubblico target, eventuali lacune o incongruenze. Cita frasi o elementi reali tratti dal documento per dimostrare che l'hai letto davvero.
 ` : ''}`;
 
-      const response = await ai.models.generateContent({
+      const response = await generateWithRetry(ai, {
         model: 'gemini-3.5-flash',
         contents: userPrompt,
         config: {
@@ -288,6 +307,60 @@ Il report deve essere formattato in bellissimo Markdown chiaro e leggibile, con 
     } catch (error: any) {
       console.error('Errore durante l\'audit AI:', error);
       res.status(500).json({ error: 'Errore interno del server durante la generazione dell\'audit.' });
+    }
+  });
+
+  app.post('/api/chat', async (req, res) => {
+    try {
+      const { message, history } = req.body as { message?: string; history?: { sender: 'user' | 'bot'; text: string }[] };
+
+      if (!message || typeof message !== 'string') {
+        return res.status(400).json({ error: 'Messaggio mancante.' });
+      }
+
+      const apiKey = process.env.GEMINI_API_KEY;
+      if (!apiKey) {
+        return res.status(500).json({ error: 'Il servizio di intelligenza artificiale non è configurato.' });
+      }
+
+      const ai = new GoogleGenAI({
+        apiKey,
+        httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
+      });
+
+      const recentHistory = Array.isArray(history) ? history.slice(-6) : [];
+      const conversationContext = recentHistory
+        .map((turn) => `${turn.sender === 'user' ? 'Cliente' : 'Tu'}: ${turn.text}`)
+        .join('\n');
+
+      const userPrompt = `${conversationContext ? `Conversazione finora:\n${conversationContext}\n\n` : ''}Nuovo messaggio del cliente: ${message}`;
+
+      const response = await generateWithRetry(ai, {
+        model: 'gemini-3.5-flash',
+        contents: userPrompt,
+        config: {
+          systemInstruction: `
+Sei l'assistente virtuale (un simpatico robot) sul sito di Giuliano Kalemi, AI & Marketing Strategist con sede a Bologna, Italia.
+Rispondi a nome di Giuliano in prima persona, con un tono informale, curioso, concreto, amichevole, mai "hype" o da venditore aggressivo.
+
+Filosofia di Giuliano: l'AI amplifica il pensiero umano, non lo sostituisce. Priorità a etica, trasparenza e strategia prima della tecnologia.
+Cosa fa Giuliano: strategia marketing e AI, automazione dei flussi di lavoro, rendering 3D fotorealistici, video AI cinematografici (Veo, Higgsfield), formazione dei team. Ha base a Bologna ma lavora anche da remoto.
+
+Regole importanti per le risposte:
+- Massimo 2-3 frasi brevi, perché la risposta viene anche letta ad alta voce dal robot.
+- Scrivi in italiano semplice e parlato, senza markdown, senza elenchi, senza emoji.
+- Se ti chiedono qualcosa che non sai o che richiede un'analisi approfondita, invita gentilmente a scrivere a kalemi1994@gmail.com o a provare l'Audit Gratuito AI sul sito.
+- Non inventare prezzi, scadenze o dettagli contrattuali specifici.
+`,
+          temperature: 0.8,
+        }
+      });
+
+      res.json({ reply: response.text });
+
+    } catch (error: any) {
+      console.error('Errore durante la chat AI:', error);
+      res.status(500).json({ error: 'Errore interno del server durante la generazione della risposta.' });
     }
   });
 

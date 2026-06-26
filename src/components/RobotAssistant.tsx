@@ -25,6 +25,8 @@ export function RobotAssistant() {
   const [activeLightboxProject, setActiveLightboxProject] = useState<Project | null>(null);
   const [quickPreviewProject, setQuickPreviewProject] = useState<Project | null>(null);
   const [loadedVideos, setLoadedVideos] = useState<Set<string>>(new Set());
+  const [chatInput, setChatInput] = useState('');
+  const [isAiThinking, setIsAiThinking] = useState(false);
 
   const markVideoLoaded = (id: string) => {
     setLoadedVideos((prev) => {
@@ -97,8 +99,8 @@ export function RobotAssistant() {
     {
       id: 'training',
       title: 'Formazione & Divulgazione AI',
-      type: 'video',
-      src: '/public/formazione.mp4',
+      type: 'image',
+      src: '/formazione.jpg',
       category: 'Cultura & Workshop',
       desc: 'Workshop interattivi e percorsi di formazione per team aziendali e professionisti, mirati a sviluppare competenze AI pratiche mantenendo sempre elevato il senso critico.'
     },
@@ -148,6 +150,12 @@ export function RobotAssistant() {
   ];
 
   useEffect(() => {
+    if (window.speechSynthesis) {
+      // Force-load the voice list early; Chrome populates it asynchronously
+      // and the first speak() call can otherwise find an empty list.
+      window.speechSynthesis.getVoices();
+      window.speechSynthesis.onvoiceschanged = () => window.speechSynthesis.getVoices();
+    }
     return () => {
       if (window.speechSynthesis) {
         window.speechSynthesis.cancel();
@@ -182,28 +190,45 @@ export function RobotAssistant() {
   };
 
   const speakText = (text: string) => {
-    if (!window.speechSynthesis) return;
-    window.speechSynthesis.cancel();
-
+    if (!window.speechSynthesis) {
+      console.warn('[Robot TTS] window.speechSynthesis non disponibile in questo browser.');
+      return;
+    }
     if (!speechEnabled) return;
 
-    const cleaned = cleanSpeechText(text);
-    const utterance = new SpeechSynthesisUtterance(cleaned);
-    speechUtteranceRef.current = utterance;
+    try {
+      window.speechSynthesis.cancel();
 
-    const voices = window.speechSynthesis.getVoices();
-    const italianVoice = voices.find((v) => v.lang.startsWith('it-IT')) || voices.find((v) => v.lang.startsWith('it'));
-    if (italianVoice) {
-      utterance.voice = italianVoice;
+      const cleaned = cleanSpeechText(text);
+      if (!cleaned.trim()) {
+        console.warn('[Robot TTS] Testo vuoto dopo la pulizia, niente da leggere:', text);
+        return;
+      }
+
+      const utterance = new SpeechSynthesisUtterance(cleaned);
+      speechUtteranceRef.current = utterance;
+
+      const voices = window.speechSynthesis.getVoices();
+      const italianVoice = voices.find((v) => v.lang.startsWith('it-IT')) || voices.find((v) => v.lang.startsWith('it'));
+      if (italianVoice) {
+        utterance.voice = italianVoice;
+      } else {
+        console.warn('[Robot TTS] Nessuna voce italiana trovata, uso la voce di default del browser. Voci disponibili:', voices.map((v) => v.lang));
+      }
+      utterance.lang = 'it-IT';
+      utterance.rate = 1.05;
+
+      utterance.onstart = () => setIsSpeaking(true);
+      utterance.onend = () => setIsSpeaking(false);
+      utterance.onerror = (e) => {
+        console.error('[Robot TTS] Errore durante la sintesi vocale:', e);
+        setIsSpeaking(false);
+      };
+
+      window.speechSynthesis.speak(utterance);
+    } catch (err) {
+      console.error('[Robot TTS] Eccezione durante speakText:', err);
     }
-    utterance.lang = 'it-IT';
-    utterance.rate = 1.05;
-
-    utterance.onstart = () => setIsSpeaking(true);
-    utterance.onend = () => setIsSpeaking(false);
-    utterance.onerror = () => setIsSpeaking(false);
-
-    window.speechSynthesis.speak(utterance);
   };
 
   // Click Outside to close
@@ -223,37 +248,42 @@ export function RobotAssistant() {
     setIsOpen(true);
     setShowNotification(false);
 
+    // Speak the greeting synchronously in the same tick as the click. Some
+    // browsers (Safari especially, but Chrome too under some conditions)
+    // silently refuse speak() calls fired from a setTimeout several seconds
+    // after the gesture that started them — so the real first utterance must
+    // fire right here, not buried inside the walk/wave animation timers.
+    const greeting = 'Ciao! Come posso aiutarti?';
+    setChatHistory([{ sender: 'bot', text: greeting }]);
+    speakText(greeting);
+
     if (prefersReducedMotion) {
       setAnimPhase('speaking');
-      triggerConversationSequence();
     } else {
       // 1) CAMMINATA START
       setAnimPhase('walking_in');
       setTimeout(() => {
         // 2) STOP AL CENTRO
         setAnimPhase('stopped');
-        
+
         setTimeout(() => {
           // 3) SALUTO CON LA MANO
           setAnimPhase('waving');
-          
+
           setTimeout(() => {
             // 4) PARLA
             setAnimPhase('speaking');
-            triggerConversationSequence();
           }, 1200); // waving duration
 
         }, 400); // settle duration
 
       }, 1500); // walking duration
     }
+
+    triggerFollowUpGreeting();
   };
 
-  const triggerConversationSequence = () => {
-    const greeting = 'Ciao! Come posso aiutarti?';
-    setChatHistory([{ sender: 'bot', text: greeting }]);
-    speakText(greeting);
-
+  const triggerFollowUpGreeting = () => {
     // Second speech bubble after a brief pause
     setTimeout(() => {
       const secondGreeting = 'Se vuoi vedere i progetti di Giuliano, te li mando qui 👇';
@@ -309,6 +339,41 @@ export function RobotAssistant() {
       setChatHistory((prev) => [...prev, { sender: 'bot', text: reply.a }]);
       speakText(reply.a);
     }, 1200);
+  };
+
+  const handleSendMessage = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const message = chatInput.trim();
+    if (!message || isAiThinking) return;
+
+    if (window.speechSynthesis) {
+      window.speechSynthesis.cancel();
+    }
+    setIsSpeaking(false);
+    setChatInput('');
+    setChatHistory((prev) => [...prev, { sender: 'user', text: message }]);
+    setIsAiThinking(true);
+    setIsTyping(true);
+
+    try {
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message, history: chatHistory }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || 'Errore di risposta.');
+
+      setChatHistory((prev) => [...prev, { sender: 'bot', text: data.reply }]);
+      speakText(data.reply);
+    } catch (err) {
+      const fallback = 'Scusa, in questo momento non riesco a risponderti. Scrivimi direttamente a kalemi1994@gmail.com!';
+      setChatHistory((prev) => [...prev, { sender: 'bot', text: fallback }]);
+      speakText(fallback);
+    } finally {
+      setIsTyping(false);
+      setIsAiThinking(false);
+    }
   };
 
   return (
@@ -380,6 +445,16 @@ export function RobotAssistant() {
                             preload="auto"
                             className="absolute inset-0 w-full h-full object-cover opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none"
                             onLoadedData={() => markVideoLoaded(proj.id)}
+                          />
+                        )}
+
+                        {proj.type === 'image' && (
+                          <img
+                            src={proj.src}
+                            alt={proj.title}
+                            loading="lazy"
+                            className="absolute inset-0 w-full h-full object-cover"
+                            onLoad={() => markVideoLoaded(proj.id)}
                           />
                         )}
                       </div>
@@ -529,6 +604,15 @@ export function RobotAssistant() {
                       {speechEnabled ? <Volume2 size={13} /> : <VolumeX size={13} />}
                     </button>
 
+                    {/* Isolated voice test button — bypasses all open/animation logic */}
+                    <button
+                      onClick={() => speakText('Ciao, mi senti? Questo è un test.')}
+                      className="px-2 py-1.5 rounded-lg bg-slate-900 border border-white/5 text-gray-400 hover:text-white hover:border-[#5FA98E]/30 transition-all cursor-pointer text-[10px] font-mono font-bold whitespace-nowrap"
+                      title="Test diretto della sintesi vocale"
+                    >
+                      🔊 Test voce
+                    </button>
+
                     {/* Close button */}
                     <button
                       onClick={handleClose}
@@ -596,6 +680,24 @@ export function RobotAssistant() {
                       </button>
                     ))}
                   </div>
+
+                  <form onSubmit={handleSendMessage} className="mt-3 flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={chatInput}
+                      onChange={(e) => setChatInput(e.target.value)}
+                      disabled={isAiThinking}
+                      placeholder="Oppure scrivimi qualunque domanda..."
+                      className="flex-1 px-3.5 py-2.5 rounded-full bg-slate-950 border border-slate-800 focus:border-[#5FA98E]/50 text-white text-xs focus:outline-none transition-colors duration-300 disabled:opacity-50"
+                    />
+                    <button
+                      type="submit"
+                      disabled={isAiThinking || !chatInput.trim()}
+                      className="px-4 py-2.5 rounded-full bg-[#5FA98E] hover:bg-[#4f9180] text-slate-950 text-xs font-bold transition-colors duration-300 disabled:opacity-40 cursor-pointer"
+                    >
+                      Invia
+                    </button>
+                  </form>
                 </div>
 
               </motion.div>
@@ -921,6 +1023,15 @@ export function RobotAssistant() {
                     preload="auto"
                     className="absolute inset-0 w-full h-full object-cover opacity-100"
                     onLoadedData={() => markVideoLoaded(activeLightboxProject.id)}
+                  />
+                )}
+
+                {activeLightboxProject.type === 'image' && (
+                  <img
+                    src={activeLightboxProject.src}
+                    alt={activeLightboxProject.title}
+                    className="absolute inset-0 w-full h-full object-cover"
+                    onLoad={() => markVideoLoaded(activeLightboxProject.id)}
                   />
                 )}
               </div>
